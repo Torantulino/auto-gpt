@@ -511,9 +511,17 @@ async def get_graphs(
     return graph_models
 
 
-async def get_executions(user_id: str) -> list[GraphExecution]:
+async def get_graphs_executions(user_id: str) -> list[GraphExecution]:
     executions = await AgentGraphExecution.prisma().find_many(
         where={"userId": user_id},
+        order={"createdAt": "desc"},
+    )
+    return [GraphExecution.from_db(execution) for execution in executions]
+
+
+async def get_graph_executions(graph_id: str, user_id: str) -> list[GraphExecution]:
+    executions = await AgentGraphExecution.prisma().find_many(
+        where={"agentGraphId": graph_id, "userId": user_id},
         order={"createdAt": "desc"},
     )
     return [GraphExecution.from_db(execution) for execution in executions]
