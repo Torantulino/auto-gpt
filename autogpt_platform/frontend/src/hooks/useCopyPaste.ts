@@ -17,7 +17,7 @@ export function useCopyPaste(getNextNodeId: () => string) {
               ...node,
               data: {
                 ...node.data,
-                connections: [],
+                connections: node.data.connections || [], // Preserve connections
               },
             })),
             edges: selectedEdges,
@@ -62,6 +62,7 @@ export function useCopyPaste(getNextNodeId: () => string) {
                 },
                 data: {
                   ...node.data,
+                  connections: node.data.connections || [], // Preserve connections
                   status: undefined,
                   executionResults: undefined,
                 },
