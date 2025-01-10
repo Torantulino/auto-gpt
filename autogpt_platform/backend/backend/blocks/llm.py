@@ -37,6 +37,7 @@ LLMProviderName = Literal[
     ProviderName.OLLAMA,
     ProviderName.OPENAI,
     ProviderName.OPEN_ROUTER,
+    ProviderName.AIML_API,
 ]
 AICredentials = CredentialsMetaInput[LLMProviderName, Literal["api_key"]]
 
@@ -100,6 +101,12 @@ class LlmModel(str, Enum, metaclass=LlmModelMeta):
     # Anthropic models
     CLAUDE_3_5_SONNET = "claude-3-5-sonnet-latest"
     CLAUDE_3_HAIKU = "claude-3-haiku-20240307"
+    # AI/ML API models
+    AIML_API_QWEN2_5_72B = "Qwen/Qwen2.5-72B-Instruct-Turbo"
+    AIML_API_LLAMA3_1_70B = "nvidia/llama-3.1-nemotron-70b-instruct"
+    AIML_API_LLAMA3_3_70B = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    AIML_API_META_LLAMA_3_1_70B = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+    AIML_API_LLAMA_3_2_3B = "meta-llama/Llama-3.2-3B-Instruct-Turbo"
     # Groq models
     LLAMA3_8B = "llama3-8b-8192"
     LLAMA3_70B = "llama3-70b-8192"
@@ -157,6 +164,11 @@ MODEL_METADATA = {
     LlmModel.GPT3_5_TURBO: ModelMetadata("openai", 16385),
     LlmModel.CLAUDE_3_5_SONNET: ModelMetadata("anthropic", 200000),
     LlmModel.CLAUDE_3_HAIKU: ModelMetadata("anthropic", 200000),
+    LlmModel.AIML_API_QWEN2_5_72B: ModelMetadata("aiml_api", 32000),
+    LlmModel.AIML_API_LLAMA3_1_70B: ModelMetadata("aiml_api", 128000),
+    LlmModel.AIML_API_LLAMA3_3_70B: ModelMetadata("aiml_api", 128000),
+    LlmModel.AIML_API_META_LLAMA_3_1_70B: ModelMetadata("aiml_api", 131000),
+    LlmModel.AIML_API_LLAMA_3_2_3B: ModelMetadata("aiml_api", 128000),
     LlmModel.LLAMA3_8B: ModelMetadata("groq", 8192),
     LlmModel.LLAMA3_70B: ModelMetadata("groq", 8192),
     LlmModel.MIXTRAL_8X7B: ModelMetadata("groq", 32768),
@@ -439,6 +451,23 @@ class AIStructuredResponseGeneratorBlock(Block):
                 response.usage.prompt_tokens if response.usage else 0,
                 response.usage.completion_tokens if response.usage else 0,
             )
+        elif provider == "aiml_api":
+            client = openai.OpenAI(
+                base_url="https://api.aimlapi.com/v2",
+                api_key=credentials.api_key.get_secret_value(),
+            )
+
+            completion = client.chat.completions.create(
+                model=llm_model.value,
+                messages=prompt,  # type: ignore
+                max_tokens=max_tokens,
+            )
+
+            return (
+                completion.choices[0].message.content or "",
+                completion.usage.prompt_tokens if completion.usage else 0,
+                completion.usage.completion_tokens if completion.usage else 0,
+            )
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -515,16 +544,19 @@ class AIStructuredResponseGeneratorBlock(Block):
                 if input_data.expected_format:
                     parsed_dict, parsed_error = parse_response(response_text)
                     if not parsed_error:
-                        yield "response", {
-                            k: (
-                                json.loads(v)
-                                if isinstance(v, str)
-                                and v.startswith("[")
-                                and v.endswith("]")
-                                else (", ".join(v) if isinstance(v, list) else v)
-                            )
-                            for k, v in parsed_dict.items()
-                        }
+                        yield (
+                            "response",
+                            {
+                                k: (
+                                    json.loads(v)
+                                    if isinstance(v, str)
+                                    and v.startswith("[")
+                                    and v.endswith("]")
+                                    else (", ".join(v) if isinstance(v, list) else v)
+                                )
+                                for k, v in parsed_dict.items()
+                            },
+                        )
                         return
                 else:
                     yield "response", {"response": response_text}
@@ -803,9 +835,7 @@ class AITextSummarizerBlock(Block):
                     chunk_overlap=input_data.chunk_overlap,
                 ),
                 credentials=credentials,
-            ).send(None)[
-                1
-            ]  # Get the first yielded value
+            ).send(None)[1]  # Get the first yielded value
 
 
 class AIConversationBlock(Block):
@@ -862,7 +892,8 @@ class AIConversationBlock(Block):
                 "The 2020 World Series was played at Globe Life Field in Arlington, Texas.",
             ),
             test_mock={
-                "llm_call": lambda *args, **kwargs: "The 2020 World Series was played at Globe Life Field in Arlington, Texas."
+                "llm_call": lambda *args,
+                **kwargs: "The 2020 World Series was played at Globe Life Field in Arlington, Texas."
             },
         )
 
