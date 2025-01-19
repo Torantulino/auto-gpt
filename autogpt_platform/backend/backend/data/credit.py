@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
@@ -7,6 +8,7 @@ from prisma.enums import CreditTransactionType
 from prisma.errors import UniqueViolationError
 from prisma.models import CreditTransaction, User
 from prisma.types import CreditTransactionCreateInput, CreditTransactionWhereInput
+from pydantic import BaseModel
 
 from backend.data import db
 from backend.data.block import Block, BlockInput, get_block
@@ -18,6 +20,7 @@ from backend.util.settings import Settings
 
 settings = Settings()
 stripe.api_key = settings.secrets.stripe_api_key
+logger = logging.getLogger(__name__)
 
 
 class UserCreditBase(ABC):
@@ -166,10 +169,11 @@ class UserCreditBase(ABC):
         is_active: bool = True,
         transaction_key: str | None = None,
         metadata: Json = Json({}),
-    ):
+    ) -> int:
         async with db.locked_transaction(f"usr_trx_{user_id}"):
             # Get latest balance snapshot
-            user_balance, _ = await self._get_credits(user_id)
+            user_balance = await self.get_credits(user_id)
+
             if amount < 0 and user_balance < abs(amount):
                 raise ValueError(
                     f"Insufficient balance for user {user_id}, balance: {user_balance}, amount: {amount}"
@@ -260,7 +264,7 @@ class UserCredit(UserCreditBase):
         if cost == 0:
             return 0
 
-        await self._add_transaction(
+        balance = await self._add_transaction(
             user_id=entry.user_id,
             amount=-cost,
             transaction_type=CreditTransactionType.USAGE,
@@ -276,6 +280,18 @@ class UserCredit(UserCreditBase):
                 }
             ),
         )
+        user_id = entry.user_id
+
+        # Auto top-up if balance just went below threshold due to this transaction.
+        auto_top_up = await get_auto_top_up(user_id)
+        if balance < auto_top_up.threshold <= balance - cost:
+            try:
+                await self.top_up_credits(user_id=user_id, amount=auto_top_up.amount)
+            except Exception as e:
+                # Failed top-up is not critical, we can move on.
+                logger.error(
+                    f"Auto top-up failed for user {user_id}, balance: {balance}, amount: {auto_top_up.amount}, error: {e}"
+                )
 
         return cost
 
@@ -283,10 +299,54 @@ class UserCredit(UserCreditBase):
         if amount < 0:
             raise ValueError(f"Top up amount must not be negative: {amount}")
 
-        await self._add_transaction(
-            user_id=user_id,
-            amount=amount,
-            transaction_type=CreditTransactionType.TOP_UP,
+        customer_id = await get_stripe_customer_id(user_id)
+
+        payment_methods = stripe.PaymentMethod.list(customer=customer_id, type="card")
+        if not payment_methods:
+            raise ValueError("No payment method found, please add it on the platform.")
+
+        for payment_method in payment_methods:
+            if amount == 0:
+                setup_intent = stripe.SetupIntent.create(
+                    customer=customer_id,
+                    usage="off_session",
+                    confirm=True,
+                    payment_method=payment_method.id,
+                    automatic_payment_methods={
+                        "enabled": True,
+                        "allow_redirects": "never",
+                    },
+                )
+                if setup_intent.status == "succeeded":
+                    return
+
+            else:
+                payment_intent = stripe.PaymentIntent.create(
+                    amount=amount,
+                    currency="usd",
+                    description="AutoGPT Platform Credits",
+                    customer=customer_id,
+                    off_session=True,
+                    confirm=True,
+                    payment_method=payment_method.id,
+                    automatic_payment_methods={
+                        "enabled": True,
+                        "allow_redirects": "never",
+                    },
+                )
+                if payment_intent.status == "succeeded":
+                    await self._add_transaction(
+                        user_id=user_id,
+                        amount=amount,
+                        transaction_type=CreditTransactionType.TOP_UP,
+                        transaction_key=payment_intent.id,
+                        metadata=Json({"payment_intent": payment_intent}),
+                        is_active=True,
+                    )
+                    return
+
+        raise ValueError(
+            f"Out of {len(payment_methods)} payment methods tried, none is supported"
         )
 
     async def top_up_intent(self, user_id: str, amount: int) -> str:
@@ -309,13 +369,14 @@ class UserCredit(UserCreditBase):
                 }
             ],
             mode="payment",
+            payment_intent_data={"setup_future_usage": "off_session"},
+            saved_payment_method_options={"payment_method_save": "enabled"},
             success_url=settings.config.platform_base_url
             + "/marketplace/credits?topup=success",
             cancel_url=settings.config.platform_base_url
             + "/marketplace/credits?topup=cancel",
         )
 
-        # Create pending transaction
         await self._add_transaction(
             user_id=user_id,
             amount=amount,
@@ -345,7 +406,7 @@ class UserCredit(UserCreditBase):
             find_filter["userId"] = user_id
 
         # Find the most recent inactive top-up transaction
-        credit_transaction = await CreditTransaction.prisma().find_first_or_raise(
+        credit_transaction = await CreditTransaction.prisma().find_first(
             where=find_filter,
             order={"createdAt": "desc"},
         )
@@ -451,3 +512,28 @@ async def get_stripe_customer_id(user_id: str) -> str:
         where={"id": user_id}, data={"stripeCustomerId": customer.id}
     )
     return customer.id
+
+
+class AutoTopUpConfig(BaseModel):
+    amount: int
+    """Amount of credits to top up."""
+    threshold: int
+    """Threshold to trigger auto top up."""
+
+
+async def set_auto_top_up(user_id: str, threshold: int, amount: int):
+    await User.prisma().update(
+        where={"id": user_id},
+        data={"topUpConfig": Json({"threshold": threshold, "amount": amount})},
+    )
+
+
+async def get_auto_top_up(user_id: str) -> AutoTopUpConfig:
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise ValueError("Invalid user ID")
+
+    if not user.topUpConfig:
+        return AutoTopUpConfig(threshold=0, amount=0)
+
+    return AutoTopUpConfig.model_validate(user.topUpConfig)
